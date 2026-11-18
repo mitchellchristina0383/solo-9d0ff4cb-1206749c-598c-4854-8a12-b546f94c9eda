@@ -10,6 +10,9 @@ services:
       LOAD_TIMEOUT: "30"
       POLL_INTERVAL: "1"
       HEALTH_INTERVAL: "10"
+      INFER_BATCH_MAX: "3"
+      INFER_BATCH_WAIT_MS: "200"
+      INFER_TIMEOUT: "15"
     ports:
       - "8000:8000"
     volumes:

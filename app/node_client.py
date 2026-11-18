@@ -124,3 +124,44 @@ async def query_replica(base_url: str, replica_id: str, epoch: int) -> CallResul
     except (httpx.HTTPError, OSError) as exc:
         return CallResult(False, connect_error=True,
                           error=f"连接失败（节点失联，继续待核）: {exc.__class__.__name__}")
+
+
+async def infer_batch(base_url: str, model_name: str, payload: dict) -> CallResult:
+    """整批下发推理请求。传输失败 = 批次是否到达不可知，调用方必须保留待核。"""
+    try:
+        c = await client()
+        r = await c.post(f"{base_url}/models/{model_name}/infer/batch", json=payload)
+        if r.status_code in (200, 202):
+            return CallResult(True, r.status_code, r.json())
+        detail = ""
+        try:
+            detail = r.json().get("detail", "")
+        except Exception:
+            detail = r.text[:200]
+        # 节点明确拒绝（如副本未加载/轮次不符）：确认未执行，可判失败
+        return CallResult(False, r.status_code,
+                          error=f"批次下发被节点拒绝(HTTP {r.status_code}): {detail}")
+    except httpx.TimeoutException:
+        return CallResult(False, timed_out=True,
+                          error="批次下发超时，节点是否收到未知（保留待核）")
+    except (httpx.HTTPError, OSError) as exc:
+        return CallResult(False, connect_error=True,
+                          error=f"连接失败（节点失联，批次状态未知，保留待核）: {exc.__class__.__name__}")
+
+
+async def query_infer_batch(base_url: str, batch_id: str, epoch: int) -> CallResult:
+    """按批次号查询原批结果（恢复对账用）；绝不重新下发。"""
+    try:
+        c = await client()
+        r = await c.get(f"{base_url}/infer/batches/{batch_id}", params={"epoch": epoch})
+        if r.status_code == 200:
+            return CallResult(True, 200, r.json())
+        if r.status_code == 404:
+            # 节点确认无此批：原批未到达/未执行（确定语义）
+            return CallResult(True, 404, {"status": "unknown"})
+        return CallResult(False, r.status_code, error=f"批次查询被拒(HTTP {r.status_code})")
+    except httpx.TimeoutException:
+        return CallResult(False, timed_out=True, error="批次查询超时（节点失联，继续待核）")
+    except (httpx.HTTPError, OSError) as exc:
+        return CallResult(False, connect_error=True,
+                          error=f"连接失败（节点失联，继续待核）: {exc.__class__.__name__}")

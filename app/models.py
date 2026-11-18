@@ -51,3 +51,53 @@ DEP_BADGE = {
     DEP_FAILED: "danger",
     DEP_UNVERIFIED: "warning",
 }
+
+# ---------------------------------------------------------------- 推理合批
+# 推理请求状态
+IREQ_PENDING = "PENDING"      # 待凑批（未下发）
+IREQ_BATCHED = "BATCHED"      # 已入批并下发，等待批次结果
+IREQ_DONE = "DONE"            # 已拿到模拟结果
+IREQ_TIMEOUT = "TIMEOUT"      # 批次超时/节点失联，随批保留待核
+IREQ_FAILED = "FAILED"        # 明确失败（节点拒绝或确认未执行）
+IREQ_REJECTED = "REJECTED"    # 轮次失效未下发（不得改投新轮，终态）
+
+IREQ_STATUS_CN = {
+    IREQ_PENDING: "待凑批",
+    IREQ_BATCHED: "批处理中",
+    IREQ_DONE: "已完成",
+    IREQ_TIMEOUT: "超时待核",
+    IREQ_FAILED: "失败",
+    IREQ_REJECTED: "已驳回",
+}
+
+IREQ_BADGE = {
+    IREQ_PENDING: "info",
+    IREQ_BATCHED: "info",
+    IREQ_DONE: "success",
+    IREQ_TIMEOUT: "warning",
+    IREQ_FAILED: "danger",
+    IREQ_REJECTED: "secondary",
+}
+
+# 批次状态
+IBATCH_SENDING = "SENDING"        # 已凑成，下发调用在途
+IBATCH_DISPATCHED = "DISPATCHED"  # 节点已受理，等待整批结果
+IBATCH_DONE = "DONE"              # 整批结果已回收
+IBATCH_TIMEOUT = "TIMEOUT"        # 下发/等待超时或失联，保留待核（不拆批重投）
+IBATCH_FAILED = "FAILED"          # 节点明确拒绝或确认未收到原批（终态）
+
+IBATCH_STATUS_CN = {
+    IBATCH_SENDING: "下发中",
+    IBATCH_DISPATCHED: "已下发",
+    IBATCH_DONE: "已完成",
+    IBATCH_TIMEOUT: "超时待核",
+    IBATCH_FAILED: "失败",
+}
+
+IBATCH_BADGE = {
+    IBATCH_SENDING: "info",
+    IBATCH_DISPATCHED: "info",
+    IBATCH_DONE: "success",
+    IBATCH_TIMEOUT: "warning",
+    IBATCH_FAILED: "danger",
+}

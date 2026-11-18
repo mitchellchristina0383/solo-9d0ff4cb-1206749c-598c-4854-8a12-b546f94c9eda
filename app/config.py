@@ -40,6 +40,12 @@ POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))
 # 节点健康探测间隔
 HEALTH_INTERVAL = float(os.environ.get("HEALTH_INTERVAL", "10.0"))
 
+# 推理合批：同一部署轮次最多凑 BATCH_MAX 条；未满时首条等待 BATCH_WAIT_MS 毫秒后下发
+INFER_BATCH_MAX = int(os.environ.get("INFER_BATCH_MAX", "3"))
+INFER_BATCH_WAIT_MS = int(os.environ.get("INFER_BATCH_WAIT_MS", "200"))
+# 等待整批结果的上限，超时后批次保留待核（不拆批重投，恢复后查询原批）
+INFER_TIMEOUT = float(os.environ.get("INFER_TIMEOUT", "15"))
+
 NODES: list[NodeConfig] = _nodes_from_env()
 NODE_MAP: dict[str, NodeConfig] = {n.node_id: n for n in NODES}
 

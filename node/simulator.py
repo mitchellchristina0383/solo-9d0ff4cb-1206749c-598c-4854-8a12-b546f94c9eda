@@ -24,7 +24,20 @@ class ControlBody(BaseModel):
     load_delay: float | None = Field(None, ge=0, le=60)
     unload_delay: float | None = Field(None, ge=0, le=60)
     ack_delay: float | None = Field(None, ge=0, le=60)
+    infer_delay: float | None = Field(None, ge=0, le=60)
     load_fail: bool | None = None
+
+
+class InferItem(BaseModel):
+    request_no: str = Field(min_length=1, max_length=64)
+    text: str = Field(min_length=1, max_length=500)
+
+
+class InferBatchBody(BaseModel):
+    batch_id: str = Field(min_length=1, max_length=64)
+    replica: str = Field(min_length=1, max_length=128)
+    epoch: int = Field(ge=1)
+    requests: list[InferItem] = Field(min_length=1, max_length=16)
 
 
 def create_app(
@@ -39,11 +52,16 @@ def create_app(
 
     # rid -> {model, mem_mb, epoch, status: loading|loaded|unloaded|failed}
     replicas: Dict[str, Dict[str, Any]] = {}
+    # batch_id -> 整批推理记录（含结果，供恢复后按原批号查询；posts 记录下发次数）
+    batches: Dict[str, Dict[str, Any]] = {}
+    # 统计：整批下发端点被实际调用的次数（验证平台不拆批重投）
+    stats: Dict[str, int] = {"infer_posts": 0}
     control: Dict[str, Any] = {
         "mode": "normal",
         "load_delay": default_load_delay,
         "unload_delay": default_unload_delay,
         "ack_delay": 0.0,
+        "infer_delay": 0.3,
         "load_fail": False,
     }
     tasks: set[asyncio.Task] = set()
@@ -167,9 +185,73 @@ def create_app(
             )
         return {"replica": rid, "epoch": epoch, **rec}
 
+    # ---------------------------------------------------------- 整批推理
+    async def finish_infer(batch_id: str, epoch: int, delay: float):
+        """整批一次处理完成：为批内每条请求生成模拟结果。"""
+        await asyncio.sleep(delay)
+        b = batches.get(batch_id)
+        # 仅当批次仍属于本次 epoch 且在处理中才落地（迟到回调不覆盖）
+        if b and b["epoch"] == epoch and b["status"] == "processing":
+            b["results"] = [
+                {
+                    "request_no": item["request_no"],
+                    "result": f"模拟输出[{node_id}|{b['model']}|e{epoch}|{item['request_no']}]"
+                              f"::{item['text'][::-1]}",
+                }
+                for item in b["requests"]
+            ]
+            b["status"] = "done"
+
+    @app.post("/models/{model_name}/infer/batch")
+    async def infer_batch(model_name: str, body: InferBatchBody):
+        stats["infer_posts"] += 1
+        rec = replicas.get(body.replica)
+        if not rec or rec["epoch"] != body.epoch or rec["status"] != "loaded":
+            return JSONResponse(
+                {"detail": f"副本未加载或轮次不符（replica={body.replica}, epoch={body.epoch}）"},
+                status_code=409,
+            )
+        existing = batches.get(body.batch_id)
+        if existing:
+            if existing["epoch"] != body.epoch:
+                return JSONResponse({"detail": "批次轮次不符"}, status_code=409)
+            # 幂等：同批次号重复下发不重复处理，仅记录次数并返回当前状态
+            existing["posts"] += 1
+            await asyncio.sleep(control["ack_delay"])
+            return JSONResponse(
+                {"batch_id": body.batch_id, "epoch": body.epoch,
+                 "status": existing["status"], "accepted": len(existing["requests"]),
+                 "deduplicated": True},
+                status_code=202,
+            )
+        batches[body.batch_id] = {
+            "batch_id": body.batch_id, "replica": body.replica, "epoch": body.epoch,
+            "model": model_name, "status": "processing",
+            "requests": [item.model_dump() for item in body.requests],
+            "results": None, "posts": 1, "created_at": time.time(),
+        }
+        schedule(control["infer_delay"],
+                 finish_infer(body.batch_id, body.epoch, control["infer_delay"]))
+        await asyncio.sleep(control["ack_delay"])
+        return JSONResponse(
+            {"batch_id": body.batch_id, "epoch": body.epoch,
+             "status": "processing", "accepted": len(body.requests)},
+            status_code=202,
+        )
+
+    @app.get("/infer/batches/{batch_id}")
+    async def query_infer_batch(batch_id: str, epoch: int = 1):
+        b = batches.get(batch_id)
+        if not b or b["epoch"] != epoch:
+            return JSONResponse(
+                {"batch_id": batch_id, "epoch": epoch, "status": "unknown"}, status_code=404
+            )
+        return b
+
     @app.get("/state")
     async def full_state():
-        return {"node_id": node_id, "control": control, "replicas": replicas}
+        return {"node_id": node_id, "control": control, "replicas": replicas,
+                "batches": batches}
 
     @app.post("/control")
     async def set_control(body: ControlBody):
@@ -180,17 +262,21 @@ def create_app(
     @app.post("/reset")
     async def reset():
         replicas.clear()
+        batches.clear()
         control.update(
             mode="normal",
             load_delay=default_load_delay,
             unload_delay=default_unload_delay,
             ack_delay=0.0,
+            infer_delay=0.3,
             load_fail=False,
         )
         return {"node_id": node_id, "reset": True}
 
     # 暴露内部句柄，供测试直接检查/重置
     app.state.replicas = replicas
+    app.state.batches = batches
+    app.state.stats = stats
     app.state.control = control
     return app
 

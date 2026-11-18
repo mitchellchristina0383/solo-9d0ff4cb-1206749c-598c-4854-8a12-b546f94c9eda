@@ -602,3 +602,432 @@ def get_deployment(dep_id: str) -> dict:
 def recent_events(limit: int = 30) -> list[dict]:
     return [dict(r) for r in db.query(
         "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))]
+
+
+# ---------------------------------------------------------------- 推理合批
+# 规则：
+# - 仅接受“已可用的单副本部署”的请求；请求号在部署内唯一（幂等，同一请求绝不进两个批次）
+# - 同一部署轮次（epoch）的待发请求凑满 INFER_BATCH_MAX 条立即整批下发；
+#   未满时首条等待 INFER_BATCH_WAIT_MS 毫秒后整批下发
+# - 下发前副本失去可用性/轮次结束：待发请求驳回（REJECTED），不得改投新轮
+# - 已下发批次超时/失联：保留待核，恢复后按原批号查询结果，绝不拆批重投；
+#   迟到回执只写回原轮次的请求，绝不写入新轮
+_flush_timers: dict[tuple[str, int], asyncio.Task] = {}
+
+
+def _ireq_view(r) -> dict:
+    d = dict(r)
+    d["status_cn"] = models.IREQ_STATUS_CN[r["status"]]
+    return d
+
+
+def _ibatch_view(b, with_requests: bool = True) -> dict:
+    d = dict(b)
+    d["status_cn"] = models.IBATCH_STATUS_CN[b["status"]]
+    d["node_name"] = config.NODE_MAP[b["node_id"]].name
+    if with_requests:
+        d["requests"] = [_ireq_view(r) for r in db.query(
+            "SELECT * FROM infer_requests WHERE batch_id=? ORDER BY created_at,id", (b["id"],))]
+    return d
+
+
+def list_infer_requests(deployment_id: str | None = None, limit: int = 100) -> list[dict]:
+    if deployment_id:
+        rows = db.query(
+            "SELECT * FROM infer_requests WHERE deployment_id=? "
+            "ORDER BY created_at DESC,id DESC LIMIT ?", (deployment_id, limit))
+    else:
+        rows = db.query(
+            "SELECT * FROM infer_requests ORDER BY created_at DESC,id DESC LIMIT ?", (limit,))
+    return [_ireq_view(r) for r in rows]
+
+
+def list_infer_batches(deployment_id: str | None = None, limit: int = 50) -> list[dict]:
+    if deployment_id:
+        rows = db.query(
+            "SELECT * FROM infer_batches WHERE deployment_id=? "
+            "ORDER BY created_at DESC,id DESC LIMIT ?", (deployment_id, limit))
+    else:
+        rows = db.query(
+            "SELECT * FROM infer_batches ORDER BY created_at DESC,id DESC LIMIT ?", (limit,))
+    return [_ibatch_view(b) for b in rows]
+
+
+def get_infer_batch(batch_id: str) -> dict:
+    b = db.query_one("SELECT * FROM infer_batches WHERE id=?", (batch_id,))
+    if not b:
+        raise HTTPException(404, "批次不存在")
+    return _ibatch_view(b)
+
+
+def _reject_round_pending_locked(conn, dep_id: str, epoch: int, reason: str) -> int:
+    """驳回某轮全部待发请求（终态，不改投新轮）。须在写事务内调用。"""
+    rows = conn.execute(
+        "SELECT id,request_no FROM infer_requests "
+        "WHERE deployment_id=? AND epoch=? AND status=?",
+        (dep_id, epoch, models.IREQ_PENDING),
+    ).fetchall()
+    for r in rows:
+        conn.execute(
+            "UPDATE infer_requests SET status=?,last_error=?,updated_at=? WHERE id=?",
+            (models.IREQ_REJECTED, reason, now(), r["id"]),
+        )
+    if rows:
+        log_event(conn, "INFER_REJECT",
+                  f"驳回 {len(rows)} 条待发请求（{','.join(r['request_no'] for r in rows)}）：{reason}",
+                  dep_id)
+    return len(rows)
+
+
+def _form_batch_locked(conn, dep, epoch: int) -> str | None:
+    """在写事务内为指定轮次凑批。副本不可用/轮次已变时驳回待发请求，返回 None。"""
+    dep_id = dep["id"]
+    if dep["status"] != models.DEP_AVAILABLE or dep["epoch"] != epoch:
+        _reject_round_pending_locked(
+            conn, dep_id, epoch,
+            f"下发前副本已失去可用性（部署{models.DEP_STATUS_CN[dep['status']]}/"
+            f"当前epoch={dep['epoch']}），未下发，不得改投新轮")
+        return None
+    replica = conn.execute(
+        "SELECT * FROM replicas WHERE deployment_id=? AND epoch=? ORDER BY seq",
+        (dep_id, epoch),
+    ).fetchone()
+    if not replica or replica["status"] != models.REP_LOADED:
+        _reject_round_pending_locked(
+            conn, dep_id, epoch,
+            "下发前副本未处于已加载状态，未下发，不得改投新轮")
+        return None
+    pendings = conn.execute(
+        "SELECT * FROM infer_requests WHERE deployment_id=? AND epoch=? AND status=? "
+        "ORDER BY created_at,id LIMIT ?",
+        (dep_id, epoch, models.IREQ_PENDING, config.INFER_BATCH_MAX),
+    ).fetchall()
+    if not pendings:
+        return None
+    batch_id = "ib-" + uuid.uuid4().hex[:10]
+    ts = now()
+    conn.execute(
+        "INSERT INTO infer_batches(id,deployment_id,epoch,node_id,replica_id,status,"
+        "request_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (batch_id, dep_id, epoch, replica["node_id"], replica["id"],
+         models.IBATCH_SENDING, len(pendings), ts, ts),
+    )
+    for r in pendings:
+        conn.execute(
+            "UPDATE infer_requests SET status=?,batch_id=?,updated_at=? WHERE id=?",
+            (models.IREQ_BATCHED, batch_id, ts, r["id"]),
+        )
+    log_event(conn, "BATCH_FORM",
+              f"合批 {batch_id}：{len(pendings)} 条请求（{','.join(r['request_no'] for r in pendings)}）"
+              f"发往 {config.NODE_MAP[replica['node_id']].name}",
+              dep_id, node_id=replica["node_id"])
+    return batch_id
+
+
+def _ensure_flush_timer(dep_id: str, epoch: int) -> None:
+    key = (dep_id, epoch)
+    if key in _flush_timers:
+        return
+    _flush_timers[key] = asyncio.create_task(_flush_after_wait(dep_id, epoch))
+
+
+def _cancel_flush_timer(dep_id: str, epoch: int) -> None:
+    task = _flush_timers.pop((dep_id, epoch), None)
+    if task:
+        task.cancel()
+
+
+async def _flush_after_wait(dep_id: str, epoch: int) -> None:
+    try:
+        await asyncio.sleep(config.INFER_BATCH_WAIT_MS / 1000)
+    finally:
+        _flush_timers.pop((dep_id, epoch), None)
+    try:
+        await flush_infer_window(dep_id, epoch)
+    except Exception as exc:  # 计时器任务不能因单次异常静默消亡
+        print(f"[infer-flush] {exc.__class__.__name__}: {exc}")
+
+
+async def flush_infer_window(dep_id: str, epoch: int) -> None:
+    """凑批窗口关闭：部署仍可用则整批下发，否则驳回（由 _form_batch_locked 保证）。"""
+    with db.tx() as conn:
+        dep = conn.execute("SELECT * FROM deployments WHERE id=?", (dep_id,)).fetchone()
+        if not dep:
+            return
+        batch_id = _form_batch_locked(conn, dep, epoch)
+    if batch_id:
+        await dispatch_batch(batch_id)
+
+
+def submit_infer_request(dep_id: str, request_no: str, text: str) -> tuple[dict, bool]:
+    """提交短文本推理请求。返回 (请求视图, 是否新建)；同请求号重复提交幂等返回原记录。"""
+    request_no = request_no.strip()
+    text = text.strip()
+    if not request_no:
+        raise HTTPException(400, "请求号不能为空")
+    if not text:
+        raise HTTPException(400, "文本不能为空")
+
+    batch_to_dispatch: str | None = None
+    with db.tx() as conn:
+        dep = conn.execute("SELECT * FROM deployments WHERE id=?", (dep_id,)).fetchone()
+        if not dep:
+            raise HTTPException(404, "部署不存在")
+        existing = conn.execute(
+            "SELECT * FROM infer_requests WHERE deployment_id=? AND request_no=?",
+            (dep_id, request_no),
+        ).fetchone()
+        if existing:
+            # 幂等：同一请求号直接返回原记录，绝不进入第二个批次
+            return _ireq_view(existing), False
+        if dep["status"] != models.DEP_AVAILABLE:
+            raise HTTPException(
+                409, f"部署当前不可用（{models.DEP_STATUS_CN[dep['status']]}），暂不接受推理请求")
+        if dep["replica_count"] != 1:
+            raise HTTPException(409, "推理合批仅支持单副本部署")
+        replica = conn.execute(
+            "SELECT * FROM replicas WHERE deployment_id=? AND epoch=? ORDER BY seq",
+            (dep_id, dep["epoch"]),
+        ).fetchone()
+        if not replica or replica["status"] != models.REP_LOADED:
+            raise HTTPException(409, "部署副本未确认加载，暂不接受推理请求")
+
+        ts = now()
+        conn.execute(
+            "INSERT INTO infer_requests(id,deployment_id,epoch,request_no,text,status,"
+            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (f"{dep_id}:{request_no}", dep_id, dep["epoch"], request_no, text,
+             models.IREQ_PENDING, ts, ts),
+        )
+        log_event(conn, "INFER_SUBMIT",
+                  f"受理推理请求 {request_no}（epoch={dep['epoch']}，文本 {len(text)} 字）", dep_id)
+        pending_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM infer_requests "
+            "WHERE deployment_id=? AND epoch=? AND status=?",
+            (dep_id, dep["epoch"], models.IREQ_PENDING),
+        ).fetchone()["c"]
+        epoch = dep["epoch"]
+        if pending_count >= config.INFER_BATCH_MAX:
+            # 满批：同一事务内立即成批
+            batch_to_dispatch = _form_batch_locked(conn, dep, epoch)
+
+    # 事务外：满批立即下发并取消凑批计时器；未满则为首条请求启动 200ms 凑批计时。
+    # 本函数为同步函数，提交与计时器操作之间无 await，不会与计时器回调交错。
+    if batch_to_dispatch:
+        _cancel_flush_timer(dep_id, epoch)
+        _spawn(dispatch_batch(batch_to_dispatch))
+    else:
+        _ensure_flush_timer(dep_id, epoch)
+    row = db.query_one(
+        "SELECT * FROM infer_requests WHERE deployment_id=? AND request_no=?",
+        (dep_id, request_no))
+    return _ireq_view(row), True
+
+
+async def dispatch_batch(batch_id: str) -> None:
+    """整批一次下发到节点；传输失败保留待核，明确拒绝判失败。"""
+    batch = db.query_one("SELECT * FROM infer_batches WHERE id=?", (batch_id,))
+    if not batch or batch["status"] != models.IBATCH_SENDING:
+        return
+    dep = db.query_one("SELECT * FROM deployments WHERE id=?", (batch["deployment_id"],))
+    if not dep:
+        return  # 部署不存在（正常流程不会发生），批次留待轮询处置
+    node = config.NODE_MAP[batch["node_id"]]
+    reqs = db.query(
+        "SELECT * FROM infer_requests WHERE batch_id=? ORDER BY created_at,id", (batch_id,))
+    payload = {
+        "batch_id": batch_id,
+        "replica": batch["replica_id"],
+        "epoch": batch["epoch"],
+        "requests": [{"request_no": r["request_no"], "text": r["text"]} for r in reqs],
+    }
+    result = await node_client.infer_batch(node.base_url, dep["model_name"], payload)
+
+    with db.tx() as conn:
+        cur = conn.execute("SELECT * FROM infer_batches WHERE id=?", (batch_id,)).fetchone()
+        if cur["status"] != models.IBATCH_SENDING:
+            return  # 已被恢复查询处置（如重启后轮询先行），迟到回执不重复写入
+        if result.ok:
+            conn.execute(
+                "UPDATE infer_batches SET status=?,dispatched_at=?,updated_at=? WHERE id=?",
+                (models.IBATCH_DISPATCHED, now(), now(), batch_id))
+            log_event(conn, "BATCH_DISPATCH",
+                      f"批次 {batch_id} 已下发至 {node.name}（{len(reqs)} 条），等待整批结果",
+                      dep["id"], node_id=node.node_id)
+            mark_node_online(node.node_id)
+        elif result.transport_failed:
+            _set_batch_timeout(conn, cur, result.error)
+            mark_node_lost(node.node_id, result.error)
+        else:
+            _set_batch_failed(conn, cur, result.error)
+
+
+def _set_batch_timeout(conn, batch, error: str) -> None:
+    """批次转超时待核：批内请求随批保留，绝不拆批重投。"""
+    conn.execute(
+        "UPDATE infer_batches SET status=?,last_error=?,updated_at=? WHERE id=?",
+        (models.IBATCH_TIMEOUT, error, now(), batch["id"]))
+    conn.execute(
+        "UPDATE infer_requests SET status=?,updated_at=? WHERE batch_id=? AND status IN (?,?)",
+        (models.IREQ_TIMEOUT, now(), batch["id"], models.IREQ_BATCHED, models.IREQ_PENDING))
+    log_event(conn, "BATCH_TIMEOUT",
+              f"批次 {batch['id']} 超时/失联：{error}。整批保留待核，恢复后查询原批结果",
+              batch["deployment_id"], node_id=batch["node_id"])
+
+
+def _set_batch_failed(conn, batch, error: str) -> None:
+    """节点明确未执行该批（拒绝/确认未收到）：批次与请求判失败（终态）。"""
+    conn.execute(
+        "UPDATE infer_batches SET status=?,last_error=?,updated_at=? WHERE id=?",
+        (models.IBATCH_FAILED, error, now(), batch["id"]))
+    conn.execute(
+        "UPDATE infer_requests SET status=?,last_error=?,updated_at=? "
+        "WHERE batch_id=? AND status IN (?,?,?)",
+        (models.IREQ_FAILED, error, now(), batch["id"],
+         models.IREQ_BATCHED, models.IREQ_PENDING, models.IREQ_TIMEOUT))
+    log_event(conn, "BATCH_FAIL", f"批次 {batch['id']} 失败：{error}",
+              batch["deployment_id"], node_id=batch["node_id"])
+
+
+def _apply_batch_results_locked(conn, batch, remote: dict) -> bool:
+    """把节点返回的整批结果写回原批次请求。轮次不符的迟到回执直接丢弃。"""
+    if int(remote.get("epoch", -1)) != batch["epoch"]:
+        log_event(conn, "INFER_LATE_DROP",
+                  f"批次 {batch['id']} 的回执轮次不符（回执epoch={remote.get('epoch')}，"
+                  f"批次epoch={batch['epoch']}），丢弃，不写入新轮",
+                  batch["deployment_id"], node_id=batch["node_id"])
+        return False
+    if batch["status"] == models.IBATCH_DONE:
+        return False
+    results = {item.get("request_no"): item.get("result", "")
+               for item in (remote.get("results") or [])}
+    reqs = conn.execute(
+        "SELECT * FROM infer_requests WHERE batch_id=?", (batch["id"],)).fetchall()
+    ts = now()
+    for req in reqs:
+        if req["request_no"] in results:
+            conn.execute(
+                "UPDATE infer_requests SET status=?,result=?,updated_at=? WHERE id=?",
+                (models.IREQ_DONE, results[req["request_no"]], ts, req["id"]))
+        else:
+            conn.execute(
+                "UPDATE infer_requests SET status=?,last_error=?,updated_at=? WHERE id=?",
+                (models.IREQ_FAILED, "节点未返回该请求结果", ts, req["id"]))
+    conn.execute(
+        "UPDATE infer_batches SET status=?,confirmed_at=?,updated_at=? WHERE id=?",
+        (models.IBATCH_DONE, ts, ts, batch["id"]))
+    log_event(conn, "BATCH_DONE",
+              f"批次 {batch['id']} 整批结果已回收（{len(results)} 条，epoch={batch['epoch']}）",
+              batch["deployment_id"], node_id=batch["node_id"])
+    return True
+
+
+async def reconcile_infer_batch(batch_id: str) -> dict:
+    """按原批号向节点查询批次结果（恢复对账；手动/自动共用）。绝不重新下发。"""
+    batch = db.query_one("SELECT * FROM infer_batches WHERE id=?", (batch_id,))
+    if not batch:
+        raise HTTPException(404, "批次不存在")
+    notes: list[str] = []
+    if batch["status"] in (models.IBATCH_DONE, models.IBATCH_FAILED):
+        return {"batch": get_infer_batch(batch_id),
+                "notes": [f"批次已终态（{models.IBATCH_STATUS_CN[batch['status']]}），无需对账"]}
+
+    node = config.NODE_MAP[batch["node_id"]]
+    result = await node_client.query_infer_batch(node.base_url, batch_id, batch["epoch"])
+
+    with db.tx() as conn:
+        cur = conn.execute("SELECT * FROM infer_batches WHERE id=?", (batch_id,)).fetchone()
+        if cur["status"] in (models.IBATCH_DONE, models.IBATCH_FAILED):
+            return {"batch": get_infer_batch(batch_id), "notes": ["批次已被并发处置为终态"]}
+        waited = (datetime.now(timezone.utc) -
+                  datetime.fromisoformat(cur["updated_at"])).total_seconds()
+
+        if result.transport_failed:
+            mark_node_lost(node.node_id, result.error)
+            if cur["status"] == models.IBATCH_SENDING and waited >= config.INFER_TIMEOUT:
+                _set_batch_timeout(conn, cur, f"下发结果未知且节点失联：{result.error}")
+                notes.append(f"{node.name} 失联，批次转超时待核")
+            elif cur["status"] == models.IBATCH_DISPATCHED and waited >= config.INFER_TIMEOUT:
+                _set_batch_timeout(conn, cur,
+                                   f"等待整批结果超过 {config.INFER_TIMEOUT:.0f}s 且节点失联")
+                notes.append(f"{node.name} 失联，批次转超时待核，保留原批待恢复后查询")
+            else:
+                notes.append(f"{node.name} 仍失联（{result.error}），批次保持"
+                             f"{models.IBATCH_STATUS_CN[cur['status']]}，继续待核")
+            return {"batch": get_infer_batch(batch_id), "notes": notes}
+
+        mark_node_online(node.node_id)
+        remote = result.data or {}
+        remote_status = remote.get("status")
+        if remote_status == "unknown":
+            # 节点称无此批。但原下发可能仍在途（慢节点尚未落库），仅在超过
+            # 超时时限后才采信“未收到”判定失败；否则继续待核观察。
+            if waited >= config.INFER_TIMEOUT:
+                _set_batch_failed(conn, cur,
+                                  "节点确认未收到原批，请求未执行；请用新请求号重新提交")
+                notes.append(f"{node.name} 确认无批次 {batch_id}，判定未执行（不拆批重投）")
+            else:
+                notes.append("节点暂未收到原批（可能仍在途），未超宽限期，继续待核")
+        elif remote_status == "done":
+            if _apply_batch_results_locked(conn, cur, remote):
+                notes.append(f"原批结果已回收：{len(remote.get('results') or [])} 条请求完成")
+            else:
+                notes.append("回执轮次不符或批次已完成，未写入")
+        elif remote_status == "processing":
+            if cur["status"] == models.IBATCH_TIMEOUT:
+                conn.execute(
+                    "UPDATE infer_batches SET status=?,updated_at=? WHERE id=?",
+                    (models.IBATCH_DISPATCHED, now(), batch_id))
+                conn.execute(
+                    "UPDATE infer_requests SET status=?,updated_at=? "
+                    "WHERE batch_id=? AND status=?",
+                    (models.IREQ_BATCHED, now(), batch_id, models.IREQ_TIMEOUT))
+                log_event(conn, "BATCH_RESUME",
+                          f"恢复后确认原批 {batch_id} 仍在节点处理中，继续等待",
+                          cur["deployment_id"], node_id=node.node_id)
+                notes.append(f"{node.name} 上原批仍在处理，恢复等待")
+            elif cur["status"] == models.IBATCH_SENDING:
+                conn.execute(
+                    "UPDATE infer_batches SET status=?,dispatched_at=?,updated_at=? WHERE id=?",
+                    (models.IBATCH_DISPATCHED, now(), now(), batch_id))
+                notes.append("节点已受理该批，等待整批结果")
+            elif waited >= config.INFER_TIMEOUT:
+                _set_batch_timeout(conn, cur,
+                                   f"节点处理超过 {config.INFER_TIMEOUT:.0f}s 未完成，保留待核")
+                notes.append("节点处理超时，批次转待核")
+            else:
+                notes.append("节点处理中，继续等待")
+        else:
+            notes.append(f"节点返回未知状态 {remote_status}，保持现状")
+
+    return {"batch": get_infer_batch(batch_id), "notes": notes}
+
+
+async def poll_infer_batches() -> None:
+    """轮询未终态批次：回收结果、执行超时判定、驱动恢复对账。"""
+    batches = db.query(
+        "SELECT id FROM infer_batches WHERE status IN (?,?,?)",
+        (models.IBATCH_SENDING, models.IBATCH_DISPATCHED, models.IBATCH_TIMEOUT))
+    for b in batches:
+        await reconcile_infer_batch(b["id"])
+
+
+def sweep_infer_pending() -> None:
+    """清理待发请求：轮次失效的驳回（不得改投新轮）；仍有效的补齐凑批计时器
+    （进程重启后内存计时器丢失，由此恢复）。"""
+    rearm: set[tuple[str, int]] = set()
+    with db.tx() as conn:
+        rows = conn.execute(
+            "SELECT r.id, r.deployment_id, r.epoch, d.status AS dep_status, d.epoch AS dep_epoch "
+            "FROM infer_requests r JOIN deployments d ON d.id=r.deployment_id "
+            "WHERE r.status=?", (models.IREQ_PENDING,)).fetchall()
+        for row in rows:
+            if row["dep_status"] != models.DEP_AVAILABLE or row["dep_epoch"] != row["epoch"]:
+                _reject_round_pending_locked(
+                    conn, row["deployment_id"], row["epoch"],
+                    f"部署轮次已失效（{models.DEP_STATUS_CN[row['dep_status']]}/"
+                    f"当前epoch={row['dep_epoch']}），未下发，不得改投新轮")
+            else:
+                rearm.add((row["deployment_id"], row["epoch"]))
+    for dep_id, epoch in rearm:
+        _ensure_flush_timer(dep_id, epoch)

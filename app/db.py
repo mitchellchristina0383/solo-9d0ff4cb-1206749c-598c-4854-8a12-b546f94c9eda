@@ -57,6 +57,39 @@ CREATE TABLE IF NOT EXISTS events (
     detail         TEXT,
     created_at     TEXT NOT NULL
 );
+-- 推理请求：请求号在部署内唯一（幂等键），同一请求绝不进入两个批次
+CREATE TABLE IF NOT EXISTS infer_requests (
+    id             TEXT PRIMARY KEY,          -- {deployment_id}:{request_no}
+    deployment_id  TEXT NOT NULL REFERENCES deployments(id),
+    epoch          INTEGER NOT NULL,          -- 提交时所属部署轮次，永不改投新轮
+    request_no     TEXT NOT NULL,
+    text           TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    batch_id       TEXT,
+    result         TEXT,
+    last_error     TEXT,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    UNIQUE(deployment_id, request_no)
+);
+CREATE INDEX IF NOT EXISTS idx_infer_req_dep ON infer_requests(deployment_id, epoch, status);
+CREATE INDEX IF NOT EXISTS idx_infer_req_batch ON infer_requests(batch_id);
+-- 合批批次：一次整批下发到节点，批次与部署轮次绑定
+CREATE TABLE IF NOT EXISTS infer_batches (
+    id             TEXT PRIMARY KEY,
+    deployment_id  TEXT NOT NULL REFERENCES deployments(id),
+    epoch          INTEGER NOT NULL,
+    node_id        TEXT NOT NULL REFERENCES nodes(node_id),
+    replica_id     TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    request_count  INTEGER NOT NULL,
+    last_error     TEXT,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    dispatched_at  TEXT,
+    confirmed_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_infer_batches_dep ON infer_batches(deployment_id);
 """
 
 

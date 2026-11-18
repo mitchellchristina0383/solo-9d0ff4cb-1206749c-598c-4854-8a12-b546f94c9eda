@@ -25,9 +25,13 @@ os.environ["NODE_CALL_TIMEOUT"] = "1.0"
 os.environ["LOAD_TIMEOUT"] = "4"
 os.environ["POLL_INTERVAL"] = "0.2"
 os.environ["HEALTH_INTERVAL"] = "3600"  # 测试中手动驱动健康监测
+os.environ["INFER_BATCH_MAX"] = "3"
+os.environ["INFER_BATCH_WAIT_MS"] = "200"
+os.environ["INFER_TIMEOUT"] = "4"
 
 from app.main import app as platform_app          # noqa: E402
-from app import config, service                    # noqa: E402
+from app import config, models, service           # noqa: E402
+from app import db as db_mod                      # noqa: E402
 from node import simulator                         # noqa: E402
 
 
@@ -75,6 +79,8 @@ async def client():
             while True:
                 await service.poll_loading()
                 await service.poll_releasing()
+                await service.poll_infer_batches()
+                service.sweep_infer_pending()
                 await asyncio.sleep(0.2)
 
         async def health_loop():
@@ -353,3 +359,365 @@ async def test_07_recovery_revokes_stale_load_then_confirms_release(client):
     r2 = await client.post("/api/deployments", json={
         "model_name": "new-tenant", "mem_per_replica_mb": 7000, "replica_count": 1})
     assert r2.status_code == 201, r2.text
+
+
+# ================================================================ 推理合批
+async def make_available_single_dep(client, model="infer-svc", mem=1024):
+    """部署一个单副本模型并等待可用，返回 (dep_id, 当前轮副本)。"""
+    r = await client.post("/api/deployments", json={
+        "model_name": model, "mem_per_replica_mb": mem, "replica_count": 1})
+    assert r.status_code == 201, r.text
+    dep_id = r.json()["id"]
+    dep = await wait_for(client, dep_id, {"AVAILABLE"})
+    cur = [x for x in dep["replicas"] if x["epoch"] == dep["epoch"]][0]
+    return dep_id, cur
+
+
+async def submit_infer(client, dep_id, no, text):
+    return await client.post("/api/infer/requests", json={
+        "deployment_id": dep_id, "request_no": no, "text": text})
+
+
+async def get_batches(client, dep_id):
+    return (await client.get(f"/api/infer/batches?deployment_id={dep_id}")).json()
+
+
+async def get_ireq(client, dep_id, request_no):
+    reqs = (await client.get(f"/api/infer/requests?deployment_id={dep_id}")).json()
+    match = [r for r in reqs if r["request_no"] == request_no]
+    assert match, f"请求 {request_no} 不存在"
+    return match[0]
+
+
+async def wait_ireq(client, dep_id, request_no, statuses, timeout=10.0):
+    deadline = asyncio.get_event_loop().time() + timeout
+    last = None
+    while asyncio.get_event_loop().time() < deadline:
+        last = await get_ireq(client, dep_id, request_no)
+        if last["status"] in statuses:
+            return last
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"请求 {request_no} 未进入 {statuses}，最后状态={last}")
+
+
+async def wait_batch(client, batch_id, statuses, timeout=10.0):
+    deadline = asyncio.get_event_loop().time() + timeout
+    last = None
+    while asyncio.get_event_loop().time() < deadline:
+        last = (await client.get(f"/api/infer/batches/{batch_id}")).json()
+        if last["status"] in statuses:
+            return last
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"批次 {batch_id} 未进入 {statuses}，最后状态={last}")
+
+
+def sim_state(client, nid):
+    return (client._transport._a if nid == "node-a" else client._transport._b).app.state
+
+
+@pytest.mark.asyncio
+async def test_08_full_batch_dispatches_immediately(client):
+    dep_id, rep = await make_available_single_dep(client)
+    # 并发 3 条：第 3 条落库即满批，同一事务内成批，不等 200ms 窗口
+    rs = await asyncio.gather(*(submit_infer(client, dep_id, f"r{i}", f"文本{i}")
+                                for i in range(3)))
+    assert all(r.status_code == 201 for r in rs), [r.text for r in rs]
+    batches = await get_batches(client, dep_id)
+    assert len(batches) == 1 and batches[0]["request_count"] == 3, batches
+    batch_id = batches[0]["id"]
+    assert batches[0]["epoch"] == 1 and batches[0]["node_id"] == rep["node_id"]
+
+    # 节点一次处理整批：节点侧恰好 1 个批次记录，且只被下发过 1 次
+    sim = sim_state(client, rep["node_id"])
+    deadline = asyncio.get_event_loop().time() + 5
+    while batch_id not in sim.batches and asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(0.05)
+    assert batch_id in sim.batches
+    assert sim.batches[batch_id]["posts"] == 1
+    assert len(sim.batches[batch_id]["requests"]) == 3
+
+    # 整批结果回收，各请求结果一一对应（模拟输出为文本逆序）
+    b = await wait_batch(client, batch_id, {"DONE"})
+    results = {r["request_no"]: r["result"] for r in b["requests"]}
+    assert set(results) == {"r0", "r1", "r2"}
+    for i in range(3):
+        assert results[f"r{i}"].startswith("模拟输出[")
+        assert f"文本{i}"[::-1] in results[f"r{i}"]
+    assert all(r["status"] == "DONE" for r in b["requests"])
+
+
+@pytest.mark.asyncio
+async def test_09_partial_batch_flushes_after_200ms(client):
+    dep_id, _ = await make_available_single_dep(client)
+    r = await submit_infer(client, dep_id, "solo", "单独一条")
+    assert r.status_code == 201 and r.json()["status"] == "PENDING"
+    # 未满批：窗口未关闭前不得下发
+    assert await get_batches(client, dep_id) == []
+
+    t0 = asyncio.get_event_loop().time()
+    batch = None
+    while asyncio.get_event_loop().time() - t0 < 3:
+        batches = await get_batches(client, dep_id)
+        if batches:
+            batch = batches[0]
+            break
+        await asyncio.sleep(0.05)
+    assert batch is not None, "200ms 窗口后仍未凑批下发"
+    elapsed = asyncio.get_event_loop().time() - t0
+    assert elapsed >= 0.15, f"未满批应等待首条 200ms，实际 {elapsed:.3f}s"
+    assert batch["request_count"] == 1
+
+    b = await wait_batch(client, batch["id"], {"DONE"})
+    assert b["requests"][0]["status"] == "DONE"
+    assert "单独一条"[::-1] in b["requests"][0]["result"]
+
+
+@pytest.mark.asyncio
+async def test_10_concurrent_submit_never_double_batches(client):
+    dep_id, _ = await make_available_single_dep(client)
+    # 同一请求号并发 6 次：幂等，只落一条记录
+    rs = await asyncio.gather(*(submit_infer(client, dep_id, "dup", "重复请求")
+                                for _ in range(6)))
+    codes = sorted(r.status_code for r in rs)
+    assert codes.count(201) == 1 and codes.count(200) == 5, codes
+    assert sum(1 for r in rs if r.json().get("deduplicated")) == 5
+    reqs = [r for r in (await client.get(
+        f"/api/infer/requests?deployment_id={dep_id}")).json() if r["request_no"] == "dup"]
+    assert len(reqs) == 1
+
+    # 再并发 7 条不同请求号：8 条总共应凑成 3+3+2 三个批次
+    rs = await asyncio.gather(*(submit_infer(client, dep_id, f"c{i}", f"并发{i}")
+                                for i in range(7)))
+    assert all(r.status_code == 201 for r in rs)
+
+    deadline = asyncio.get_event_loop().time() + 12
+    while asyncio.get_event_loop().time() < deadline:
+        reqs = (await client.get(f"/api/infer/requests?deployment_id={dep_id}")).json()
+        if len(reqs) == 8 and all(r["status"] == "DONE" for r in reqs):
+            break
+        await asyncio.sleep(0.2)
+    assert len(reqs) == 8 and all(r["status"] == "DONE" for r in reqs), reqs
+
+    batches = await get_batches(client, dep_id)
+    assert len(batches) == 3, batches
+    assert sorted(b["request_count"] for b in batches) == [2, 3, 3]
+    # 关键断言：任一请求只出现在一个批次中
+    owner = {}
+    for b in batches:
+        for r in b["requests"]:
+            assert r["id"] not in owner, f"请求 {r['request_no']} 进入两个批次"
+            owner[r["id"]] = b["id"]
+    assert len(owner) == 8
+
+
+@pytest.mark.asyncio
+async def test_11_dispatch_timeout_keeps_batch_then_recovers_original(client):
+    # 场景：批次下发时节点失联（传输层失败），平台保留整批待核；
+    # 节点其实已受理并算完该批（迟到回执），恢复后平台按原批号查询回收结果，
+    # 绝不拆批重投。
+    dep_id, rep = await make_available_single_dep(client)
+    nid = rep["node_id"]
+    await client.post(f"/api/nodes/{nid}/control", json={"mode": "unreachable"})
+    rs = await asyncio.gather(*(submit_infer(client, dep_id, f"t{i}", f"超时{i}")
+                                for i in range(3)))
+    assert all(r.status_code == 201 for r in rs)
+    batches = await get_batches(client, dep_id)
+    assert len(batches) == 1
+    batch_id = batches[0]["id"]
+
+    # 下发失联 → 批次与批内请求保留待核
+    b = await wait_batch(client, batch_id, {"TIMEOUT"})
+    assert all(r["status"] == "TIMEOUT" for r in b["requests"])
+    sim = sim_state(client, nid)
+    assert sim.stats["infer_posts"] == 0  # 失联期间下发从未到达节点
+
+    # 节点在“失联期间”其实受理并算完了该批（迟到回执落地），随后恢复
+    sim.batches[batch_id] = {
+        "batch_id": batch_id, "replica": rep["id"], "epoch": 1,
+        "model": "infer-svc", "status": "done",
+        "requests": [{"request_no": f"t{i}", "text": f"超时{i}"} for i in range(3)],
+        "results": [{"request_no": f"t{i}",
+                     "result": f"模拟输出[{nid}|infer-svc|e1|t{i}]::{f'超时{i}'[::-1]}"}
+                    for i in range(3)],
+        "posts": 1, "created_at": 0.0,
+    }
+    await client.post(f"/api/nodes/{nid}/control", json={"mode": "normal"})
+
+    # 恢复后平台按原批号查询，回收整批结果
+    b = await wait_batch(client, batch_id, {"DONE"}, timeout=10)
+    assert all(r["status"] == "DONE" for r in b["requests"])
+    results = {r["request_no"]: r["result"] for r in b["requests"]}
+    for i in range(3):
+        assert f"超时{i}"[::-1] in results[f"t{i}"]
+    # 恢复靠的是查询原批，不是重投：节点侧下发端点始终未被再次调用
+    assert sim.stats["infer_posts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_12_unreachable_batch_never_resent_and_fails_definitively(client):
+    dep_id, rep = await make_available_single_dep(client)
+    nid = rep["node_id"]
+    await client.post(f"/api/nodes/{nid}/control", json={"mode": "unreachable"})
+    rs = await asyncio.gather(*(submit_infer(client, dep_id, f"u{i}", f"失联{i}")
+                                for i in range(2)))
+    assert all(r.status_code == 201 for r in rs)
+    # 2 条未满批，等 200ms 窗口凑批
+    batch_id = None
+    deadline = asyncio.get_event_loop().time() + 3
+    while asyncio.get_event_loop().time() < deadline:
+        batches = await get_batches(client, dep_id)
+        if batches:
+            batch_id = batches[0]["id"]
+            break
+        await asyncio.sleep(0.05)
+    assert batch_id is not None
+
+    # 下发失联 → 批次保留待核
+    b = await wait_batch(client, batch_id, {"TIMEOUT"})
+    assert all(r["status"] == "TIMEOUT" for r in b["requests"])
+
+    # 恢复后节点确认从未收到原批 → 明确判失败（未执行），且绝不重投
+    await client.post(f"/api/nodes/{nid}/control", json={"mode": "normal"})
+    b = await wait_batch(client, batch_id, {"FAILED"}, timeout=12)
+    assert "未收到原批" in (b["last_error"] or "")
+    assert all(r["status"] == "FAILED" for r in b["requests"])
+    sim = sim_state(client, nid)
+    assert batch_id not in sim.batches  # 节点从未收到，平台也未重投
+    assert sim.stats["infer_posts"] == 0
+
+    # 失败请求保持原批次终态，不会被重新凑批；新请求号可正常提交
+    batches = await get_batches(client, dep_id)
+    assert len(batches) == 1
+    r = await submit_infer(client, dep_id, "n1", "恢复后的新请求")
+    assert r.status_code == 201
+    req = await wait_ireq(client, dep_id, "n1", {"DONE"})
+    assert req["batch_id"] != batch_id
+
+
+@pytest.mark.asyncio
+async def test_13_pending_rejected_when_replica_lost_before_flush(client):
+    dep_id, rep = await make_available_single_dep(client)
+    r = await submit_infer(client, dep_id, "p1", "待下发")
+    assert r.status_code == 201 and r.json()["status"] == "PENDING"
+
+    # 副本在下发前失去可用性（部署转待核）
+    with db_mod.tx() as conn:
+        service._set_replica(conn, rep["id"], models.REP_UNVERIFIED, error="演练：副本待核")
+        service._evaluate(conn, dep_id)
+
+    # 凑批窗口关闭时不得改投：请求被驳回，不生成任何批次
+    req = await wait_ireq(client, dep_id, "p1", {"REJECTED"})
+    assert req["batch_id"] is None
+    await asyncio.sleep(0.5)
+    assert await get_batches(client, dep_id) == []
+
+    # 部署恢复可用（同轮补确认）：已驳回请求不得重新入批
+    with db_mod.tx() as conn:
+        service._set_replica(conn, rep["id"], models.REP_LOADED, confirmed=True)
+        service._evaluate(conn, dep_id)
+    dep = (await client.get(f"/api/deployments/{dep_id}")).json()
+    assert dep["status"] == "AVAILABLE"
+    await asyncio.sleep(0.5)
+    req = await get_ireq(client, dep_id, "p1")
+    assert req["status"] == "REJECTED" and req["batch_id"] is None
+    assert await get_batches(client, dep_id) == []
+
+    # 同请求号重复提交：幂等返回已驳回记录，不会重新入批
+    r2 = await submit_infer(client, dep_id, "p1", "待下发")
+    assert r2.status_code == 200 and r2.json()["deduplicated"]
+    assert r2.json()["status"] == "REJECTED"
+    # 新请求号可正常入批完成
+    r3 = await submit_infer(client, dep_id, "p2", "新的请求")
+    assert r3.status_code == 201
+    req = await wait_ireq(client, dep_id, "p2", {"DONE"})
+    assert req["batch_id"]
+
+
+@pytest.mark.asyncio
+async def test_14_pending_rejected_when_round_ends_no_retarget(client):
+    dep_id, rep = await make_available_single_dep(client)
+    r = await submit_infer(client, dep_id, "e1", "旧轮请求")
+    assert r.status_code == 201 and r.json()["epoch"] == 1
+
+    # 部署失败（副本显式失效）→ 旧轮次结束
+    with db_mod.tx() as conn:
+        service._set_replica(conn, rep["id"], models.REP_LOAD_FAILED,
+                             error="演练：副本失效", released=True)
+        service._evaluate(conn, dep_id)
+    req = await wait_ireq(client, dep_id, "e1", {"REJECTED"})
+    assert req["batch_id"] is None
+
+    # 重试开启新轮次，部署恢复可用
+    r = await client.post(f"/api/deployments/{dep_id}/retry")
+    assert r.status_code == 200
+    dep = await wait_for(client, dep_id, {"AVAILABLE"})
+    assert dep["epoch"] == 2
+
+    # 旧轮请求不得改投新轮：仍为驳回终态，且不在任何批次中
+    await asyncio.sleep(0.5)
+    req = await get_ireq(client, dep_id, "e1")
+    assert req["status"] == "REJECTED" and req["batch_id"] is None
+
+    r2 = await submit_infer(client, dep_id, "e2", "新轮请求")
+    assert r2.status_code == 201 and r2.json()["epoch"] == 2
+    req2 = await wait_ireq(client, dep_id, "e2", {"DONE"})
+    batches = await get_batches(client, dep_id)
+    assert batches and all(b["epoch"] == 2 for b in batches)
+    assert all(req["request_no"] != "e1" for b in batches for req in b["requests"])
+
+
+@pytest.mark.asyncio
+async def test_15_late_receipt_never_written_into_new_round(client):
+    dep_id, rep = await make_available_single_dep(client)
+    nid = rep["node_id"]
+    # 节点处理整批需 6s（> INFER_TIMEOUT=4）：批次会超时待核，但节点最终算完
+    await client.post(f"/api/nodes/{nid}/control", json={"infer_delay": 6})
+    rs = await asyncio.gather(*(submit_infer(client, dep_id, f"w{i}", f"旧批{i}")
+                                for i in range(3)))
+    assert all(r.status_code == 201 for r in rs)
+    batch1 = (await get_batches(client, dep_id))[0]["id"]
+    b1 = await wait_batch(client, batch1, {"DISPATCHED"})
+    assert b1["epoch"] == 1
+    # 等待整批结果超时 → 保留待核
+    b1 = await wait_batch(client, batch1, {"TIMEOUT"}, timeout=8)
+    assert all(r["status"] == "TIMEOUT" for r in b1["requests"])
+
+    # 旧批仍在节点处理时，部署进入新轮次（待核→释放→失败→重试）
+    with db_mod.tx() as conn:
+        service._set_replica(conn, rep["id"], models.REP_UNVERIFIED, error="演练：副本待核")
+        service._evaluate(conn, dep_id)
+    await service.request_release(rep["id"], "演练：撤销旧加载")
+    await client.post(f"/api/deployments/{dep_id}/reconcile")
+    dep = await wait_for(client, dep_id, {"FAILED"})
+    r = await client.post(f"/api/deployments/{dep_id}/retry")
+    assert r.status_code == 200
+    dep = await wait_for(client, dep_id, {"AVAILABLE"})
+    assert dep["epoch"] == 2
+
+    # 新轮提交新请求（恢复正常推理时延）
+    await client.post(f"/api/nodes/{nid}/control", json={"infer_delay": 0.3})
+    rs = await asyncio.gather(*(submit_infer(client, dep_id, f"n{i}", f"新批{i}")
+                                for i in range(3)))
+    assert all(r.status_code == 201 and r.json()["epoch"] == 2 for r in rs)
+    batches = await get_batches(client, dep_id)
+    assert len(batches) == 2
+    batch2 = next(b["id"] for b in batches if b["epoch"] == 2)
+    assert batch2 != batch1
+
+    # 旧批的迟到回执到达：只能写回旧轮请求，绝不能写入新轮
+    b1 = await wait_batch(client, batch1, {"DONE"}, timeout=10)
+    assert b1["epoch"] == 1
+    assert all(r["status"] == "DONE" for r in b1["requests"])
+    assert all("|e1|" in r["result"] for r in b1["requests"])
+    assert {r["request_no"] for r in b1["requests"]} == {"w0", "w1", "w2"}
+
+    b2 = await wait_batch(client, batch2, {"DONE"}, timeout=10)
+    assert b2["epoch"] == 2
+    assert {r["request_no"] for r in b2["requests"]} == {"n0", "n1", "n2"}
+    assert all("|e2|" in r["result"] for r in b2["requests"])
+    # 两个批次的请求集合互不重叠
+    assert not ({r["request_no"] for r in b1["requests"]}
+                & {r["request_no"] for r in b2["requests"]})
+    # 旧批全程只下发过 1 次
+    sim = sim_state(client, nid)
+    assert sim.batches[batch1]["posts"] == 1

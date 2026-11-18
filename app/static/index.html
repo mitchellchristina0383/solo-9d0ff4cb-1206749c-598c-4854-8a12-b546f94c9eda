@@ -73,6 +73,26 @@
           <div style="margin-top:12px"><button type="submit">提交部署</button></div>
         </form>
       </div>
+      <div class="card">
+        <h2>提交推理请求（自动合批）</h2>
+        <form id="infer-form">
+          <label>目标部署（仅“可用”的单副本部署）</label>
+          <select name="deployment_id" id="infer-dep" required></select>
+          <label>请求号（部署内唯一，重复提交幂等）</label>
+          <input name="request_no" id="infer-no" required maxlength="64">
+          <label>短文本</label>
+          <input name="text" id="infer-text" required maxlength="500" placeholder="例如 你好，值班台">
+          <div style="margin-top:12px">
+            <button type="submit">提交请求</button>
+            <button type="button" class="ghost" onclick="submitInfer(3)">连发 3 条（演示满批立即下发）</button>
+          </div>
+        </form>
+        <div class="muted" style="margin-top:8px">
+          同一部署轮次至多凑 3 条：满批立即整批下发；未满时首条等待 200ms 后下发。
+          故障演示：先注入“迟到回执4s”或“模拟失联”再提交，批次转超时待核；
+          恢复后平台按原批号查询结果，不拆批重投。
+        </div>
+      </div>
     </div>
     <div>
       <div class="card">
@@ -91,6 +111,19 @@
       <thead><tr><th>部署/模型</th><th>规格</th><th>状态</th><th>副本分配</th><th>操作</th></tr></thead>
       <tbody id="deployments"></tbody>
     </table>
+  </div>
+  <div class="card">
+    <h2>推理合批与结果</h2>
+    <table>
+      <thead><tr><th>批次</th><th>部署/轮次</th><th>节点</th><th>状态</th><th>批内请求与模拟结果</th><th>操作</th></tr></thead>
+      <tbody id="batches"></tbody>
+    </table>
+    <details style="margin-top:10px"><summary>全部推理请求流水</summary>
+      <table>
+        <thead><tr><th>请求号</th><th>部署/轮次</th><th>文本</th><th>状态</th><th>批次</th><th>模拟结果/说明</th></tr></thead>
+        <tbody id="infer-requests"></tbody>
+      </table>
+    </details>
   </div>
 </main>
 <div id="toast"></div>
@@ -115,10 +148,12 @@ function badge(cn, kind){ return `<span class="badge ${BADGE[kind]||'badge-secon
 
 async function refresh(){
   try{
-    const [nodes, deps, events] = await Promise.all([
-      api('/api/nodes'), api('/api/deployments'), api('/api/events?limit=20')
+    const [nodes, deps, events, batches, ireqs] = await Promise.all([
+      api('/api/nodes'), api('/api/deployments'), api('/api/events?limit=20'),
+      api('/api/infer/batches?limit=30'), api('/api/infer/requests?limit=50')
     ]);
     renderNodes(nodes); renderFaults(nodes); renderDeps(deps); renderEvents(events);
+    renderInferDeps(deps); renderBatches(batches); renderIreqs(ireqs);
     document.getElementById('clock').textContent = '更新于 ' + new Date().toLocaleTimeString();
   }catch(e){ toast('刷新失败: '+e.message, true); }
 }
@@ -197,6 +232,90 @@ function renderEvents(events){
       ${e.node_id?esc(e.node_id)+' ':''}${esc(e.detail||'')}</div>`).join('');
 }
 
+// ---------------------------------------------------------------- 推理合批
+const IREQ_BADGE={PENDING:'info',BATCHED:'info',DONE:'success',TIMEOUT:'warning',
+  FAILED:'danger',REJECTED:'secondary'};
+const IBATCH_BADGE={SENDING:'info',DISPATCHED:'info',DONE:'success',TIMEOUT:'warning',
+  FAILED:'danger'};
+
+function suggestReqNo(){
+  document.getElementById('infer-no').value = 'req-' + Date.now().toString(36);
+}
+function renderInferDeps(deps){
+  const sel = document.getElementById('infer-dep');
+  const cur = sel.value;
+  const usable = deps.filter(d=>d.status==='AVAILABLE' && d.replica_count===1);
+  sel.innerHTML = usable.map(d=>
+    `<option value="${esc(d.id)}">${esc(d.model_name)}（${esc(d.id)} · epoch ${d.epoch}）</option>`
+  ).join('') || '<option value="">（暂无可用单副本部署）</option>';
+  if([...sel.options].some(o=>o.value===cur)) sel.value = cur;
+}
+function renderBatches(batches){
+  document.getElementById('batches').innerHTML = batches.map(b=>{
+    const reqs = b.requests.map(r=>`<div class="rep">
+      <b>${esc(r.request_no)}</b> · ${badge(r.status_cn, IREQ_BADGE[r.status]||'secondary')}
+      ${r.result?`<div>⇒ ${esc(r.result)}</div>`:''}
+      ${r.last_error?`<div class="reason">${esc(r.last_error)}</div>`:''}
+    </div>`).join('');
+    const canReconcile = ['SENDING','DISPATCHED','TIMEOUT'].includes(b.status);
+    return `<tr>
+      <td><b>${esc(b.id)}</b><br><span class="muted">${b.request_count} 条 · ${esc(b.created_at)}</span></td>
+      <td>${esc(b.deployment_id)}<br><span class="muted">epoch ${b.epoch}</span></td>
+      <td>${esc(b.node_name)}</td>
+      <td>${badge(b.status_cn, IBATCH_BADGE[b.status]||'secondary')}
+        ${b.last_error?`<div class="reason">${esc(b.last_error)}</div>`:''}</td>
+      <td style="min-width:260px">${reqs}</td>
+      <td><button class="ghost" ${canReconcile?'':'disabled'}
+        onclick="reconcileBatch('${b.id}')">查询原批</button></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="6" class="muted">暂无批次</td></tr>';
+}
+function renderIreqs(reqs){
+  document.getElementById('infer-requests').innerHTML = reqs.map(r=>`<tr>
+    <td><b>${esc(r.request_no)}</b></td>
+    <td>${esc(r.deployment_id)}<br><span class="muted">epoch ${r.epoch}</span></td>
+    <td>${esc(r.text)}</td>
+    <td>${badge(r.status_cn, IREQ_BADGE[r.status]||'secondary')}</td>
+    <td>${esc(r.batch_id||'—')}</td>
+    <td>${r.result?esc(r.result):''}${r.last_error?`<span class="reason">${esc(r.last_error)}</span>`:''}</td>
+  </tr>`).join('') || '<tr><td colspan="6" class="muted">暂无推理请求</td></tr>';
+}
+async function submitInfer(n){
+  const depId = document.getElementById('infer-dep').value;
+  const text = document.getElementById('infer-text').value.trim() || '你好';
+  if(!depId){ toast('请先选择可用的单副本部署', true); return; }
+  const base = Date.now().toString(36);
+  const jobs = [];
+  for(let i=0;i<n;i++){
+    jobs.push(api('/api/infer/requests',{method:'POST',body:JSON.stringify({
+      deployment_id: depId, request_no: `req-${base}-${i+1}`,
+      text: n>1 ? `${text} #${i+1}` : text})}));
+  }
+  const rs = await Promise.allSettled(jobs);
+  const failed = rs.filter(r=>r.status==='rejected');
+  const dedup = rs.filter(r=>r.status==='fulfilled' && r.value.deduplicated);
+  if(failed.length) toast(failed[0].reason.message, true);
+  else if(dedup.length) toast('请求号已存在，幂等返回原记录（未重复入批）');
+  else toast(n>1 ? `已受理 ${n} 条请求，凑批中` : '请求已受理，凑批中');
+  suggestReqNo(); refresh();
+}
+async function reconcileBatch(id){
+  try{ const r = await api(`/api/infer/batches/${id}/reconcile`,{method:'POST'});
+    (r.notes||[]).forEach(n=>toast(n)); refresh();
+  }catch(e){ toast(e.message,true); }
+}
+document.getElementById('infer-form').addEventListener('submit', async (ev)=>{
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  try{
+    const r = await api('/api/infer/requests',{method:'POST',body:JSON.stringify({
+      deployment_id: fd.get('deployment_id'),
+      request_no: fd.get('request_no'), text: fd.get('text')})});
+    toast(r.deduplicated ? '请求号已存在，幂等返回原记录' : `请求已受理: ${r.request_no}`);
+    suggestReqNo(); refresh();
+  }catch(e){ toast(e.message, true); }
+});
+
 document.getElementById('deploy-form').addEventListener('submit', async (ev)=>{
   ev.preventDefault();
   const fd = new FormData(ev.target);
@@ -208,6 +327,7 @@ document.getElementById('deploy-form').addEventListener('submit', async (ev)=>{
   }catch(e){ toast(e.message, true); }
 });
 refresh();
+suggestReqNo();
 setInterval(refresh, 2000);
 </script>
 </body>

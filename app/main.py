@@ -8,7 +8,7 @@ from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -26,7 +26,14 @@ class ControlBody(BaseModel):
     load_delay: float | None = Field(default=None, ge=0, le=60)
     unload_delay: float | None = Field(default=None, ge=0, le=60)
     ack_delay: float | None = Field(default=None, ge=0, le=60)
+    infer_delay: float | None = Field(default=None, ge=0, le=60)
     load_fail: bool | None = None
+
+
+class InferBody(BaseModel):
+    deployment_id: str = Field(min_length=1, max_length=64)
+    request_no: str = Field(min_length=1, max_length=64)
+    text: str = Field(min_length=1, max_length=500)
 
 
 async def _poll_loop() -> None:
@@ -34,6 +41,8 @@ async def _poll_loop() -> None:
         try:
             await service.poll_loading()
             await service.poll_releasing()
+            await service.poll_infer_batches()
+            service.sweep_infer_pending()
         except Exception as exc:  # 后台循环不能因单次异常退出
             print(f"[poll] {exc.__class__.__name__}: {exc}")
         await asyncio.sleep(config.POLL_INTERVAL)
@@ -107,6 +116,39 @@ async def reconcile(dep_id: str):
 @app.get("/api/events")
 async def events(limit: int = 30):
     return service.recent_events(limit)
+
+
+# ---------------------------------------------------------------- 推理合批
+@app.post("/api/infer/requests")
+async def submit_infer(body: InferBody):
+    """提交短文本推理请求；同部署内请求号幂等（重复提交返回原记录）。"""
+    view, created = service.submit_infer_request(
+        body.deployment_id, body.request_no, body.text)
+    return JSONResponse(
+        {**view, "deduplicated": not created},
+        status_code=201 if created else 200,
+    )
+
+
+@app.get("/api/infer/requests")
+async def list_infer_requests(deployment_id: str | None = None, limit: int = 100):
+    return service.list_infer_requests(deployment_id, limit)
+
+
+@app.get("/api/infer/batches")
+async def list_infer_batches(deployment_id: str | None = None, limit: int = 50):
+    return service.list_infer_batches(deployment_id, limit)
+
+
+@app.get("/api/infer/batches/{batch_id}")
+async def get_infer_batch(batch_id: str):
+    return service.get_infer_batch(batch_id)
+
+
+@app.post("/api/infer/batches/{batch_id}/reconcile")
+async def reconcile_infer_batch(batch_id: str):
+    """手动对账：按原批号向节点查询批次结果（绝不重新下发）。"""
+    return await service.reconcile_infer_batch(batch_id)
 
 
 @app.post("/api/nodes/{node_id}/control")
